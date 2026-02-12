@@ -7,6 +7,12 @@
 ```
 whisker_sensor_force_calibration/
 │
+├── stage_control/                    # 线性平台控制 ⭐
+│   ├── stage_module.py              # 核心控制库
+│   ├── control_and_monitor_stages.py # 交互式控制面板 (推荐)
+│   ├── monitor_stage_positions.py   # 位置监控工具
+│   └── README.md                     # 使用说明
+│
 ├── bota_sensor/                      # Bota力传感器工具 ⭐
 │   ├── visualize_realtime.py        # 实时可视化 - 综合视图 (推荐)
 │   ├── visualize_detailed.py        # 实时可视化 - 详细视图
@@ -17,19 +23,30 @@ whisker_sensor_force_calibration/
 │   │   └── ethercat_gen0.json       # EtherCAT Gen0配置 (当前使用)
 │   └── examples/                     # 官方示例代码
 │
-├── calib_manager.py                  # 校准管理器
-├── calibrate.py                      # 校准主程序
-├── diagnostic.py                     # 诊断工具
-├── stage_module.py                   # Stage控制模块
-├── stage_module_improved.py          # 改进的Stage控制
-└── QUICKSTART.md                     # 快速入门指南
+└── QUICKSTART.md                     # 快速入门指南 (遗留)
 ```
 
 ## 🚀 快速开始
 
-### 1. Bota传感器实时可视化
+### 1. 线性平台控制
 
-**最常用** - 查看力/力矩实时数据：
+**最常用** - 控制X/Y/Z三轴线性平台：
+
+```bash
+cd "E:\02 2024\04 Research\whisker_sensor_force_calibration\stage_control"
+
+# 启动控制面板 (推荐)
+python control_and_monitor_stages.py
+
+# 或仅监控位置
+python monitor_stage_positions.py
+```
+
+详细说明见：[stage_control/README.md](stage_control/README.md)
+
+### 2. Bota传感器实时可视化
+
+**查看力/力矩实时数据**：
 
 ```bash
 # 以管理员身份运行PowerShell
@@ -40,12 +57,6 @@ python bota_sensor/visualize_realtime.py
 ```
 
 详细说明见：[bota_sensor/README.md](bota_sensor/README.md)
-
-### 2. 校准流程
-
-```bash
-python calibrate.py
-```
 
 ## ⚙️ 系统配置
 
@@ -62,10 +73,25 @@ conda create -n whisker python=3.10
 conda activate whisker
 
 # 安装依赖
-pip install bota-driver matplotlib numpy
+pip install bota-driver matplotlib numpy pyserial
 ```
 
 ## 📊 主要功能
+
+### 线性平台控制
+- ✅ 三轴独立控制 (X/Y/Z)
+- ✅ 实时位置显示
+- ✅ 交互式GUI面板
+- ✅ 增量移动 (±5mm)
+- ✅ 直接输入目标位置
+- ✅ 归零功能
+- ✅ 自动范围限制保护
+
+**硬件配置**:
+- X/Y轴: LSM100A (0-101.6 mm)
+- Z轴: LSM50A (0-50.8 mm)
+- 通信: COM11, 9600 baud
+- 精度: 0.000047625 mm/step
 
 ### Bota传感器
 - ✅ 实时数据可视化 (力/力矩)
@@ -74,10 +100,10 @@ pip install bota-driver matplotlib numpy
 - ✅ 温度监控
 - ✅ 采样率可调 (200-2000 Hz)
 
-### 校准系统
-- Stage位置控制
-- 力-位移数据采集
-- 校准数据管理
+**传感器配置**:
+- 型号: BFT-ROKS-ECAT-M8 (SN000856)
+- 连接: EtherCAT Gen0
+- 采样率: ~1000 Hz
 
 ## 🔧 配置说明
 
