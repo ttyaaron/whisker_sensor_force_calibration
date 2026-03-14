@@ -33,23 +33,50 @@ class StageModuleControl():
     self.ser.reset_input_buffer()
     self.ser.reset_output_buffer()
 
+  def _read_response_for_id(self, timeout_s=3.0, expected_cmd=None):
+    """Read 6-byte frames until a response for this module ID (and optional command) arrives."""
+    deadline = time.time() + timeout_s
+    mismatched_ids = []
+    mismatched_cmds = []
+
+    while time.time() < deadline:
+      if self.ser.inWaiting() < 6:
+        time.sleep(0.001)
+        continue
+
+      response = self.ser.read(6)
+      if len(response) < 6:
+        time.sleep(0.001)
+        continue
+
+      rid, cmd, val = struct.unpack('<BBI', response)
+      if rid == self.id:
+        if expected_cmd is None or cmd == expected_cmd:
+          return rid, cmd, val
+        mismatched_cmds.append(cmd)
+        continue
+
+      mismatched_ids.append(rid)
+
+    mismatch_id_text = f", seen other IDs: {sorted(set(mismatched_ids))}" if mismatched_ids else ""
+    mismatch_cmd_text = (
+      f", seen other CMDs for this ID: {sorted(set(mismatched_cmds))}"
+      if mismatched_cmds else ""
+    )
+    if expected_cmd is not None:
+      raise TimeoutError(
+        f"Stage {self.id}: response timeout waiting for CMD {expected_cmd}"
+        f"{mismatch_id_text}{mismatch_cmd_text}"
+      )
+    raise TimeoutError(f"Stage {self.id}: response timeout{mismatch_id_text}{mismatch_cmd_text}")
+
   def home(self):
     # Clear buffer before sending command
     self.ser.reset_input_buffer()
     msg = bytearray(struct.pack('BB', self.id, 1)) + bytearray(struct.pack('<I', 0))
     self.ser.write(msg)
-    time.sleep(0.01)  # Small delay for command to process
-    
-    # Wait for response with timeout
-    timeout = time.time() + 2.0
-    while not self.ser.inWaiting():
-      if time.time() > timeout:
-        raise TimeoutError(f"Stage {self.id}: Home command timeout")
-      time.sleep(0.001)
-    
-    id, cmd, val = struct.unpack('<BBI', self.ser.read(6))
-    if id != self.id:
-      raise ValueError(f"Stage {self.id}: Home response ID mismatch (got {id})")
+    # Homing acknowledgement can be slower on some controllers.
+    self._read_response_for_id(timeout_s=5.0, expected_cmd=1)
 
   def go_pos_mm(self, pos, wait=True):
     # convert position in millimeters to steps
@@ -62,18 +89,7 @@ class StageModuleControl():
     self.ser.write(msg)
     
     if wait:
-      time.sleep(0.01)  # Small delay for command to process
-      
-      # Wait for response with timeout
-      timeout = time.time() + 2.0
-      while not self.ser.inWaiting():
-        if time.time() > timeout:
-          raise TimeoutError(f"Stage {self.id}: Move command timeout")
-        time.sleep(0.001)
-      
-      id, cmd, val = struct.unpack('<BBI', self.ser.read(6))
-      if not (id == self.id):
-        raise ValueError(f"Stage {self.id}: Move response ID mismatch (expected {self.id}, got {id})")
+      self._read_response_for_id(timeout_s=3.0, expected_cmd=20)
 
   def go_pos(self, pos, wait=True):
     # Clear buffer before sending command
@@ -83,45 +99,16 @@ class StageModuleControl():
     self.ser.write(msg)
     
     if wait:
-      time.sleep(0.01)  # Small delay for command to process
-      
-      # Wait for response with timeout
-      timeout = time.time() + 2.0
-      while not self.ser.inWaiting():
-        if time.time() > timeout:
-          raise TimeoutError(f"Stage {self.id}: Move command timeout")
-        time.sleep(0.001)
-      
-      id, cmd, val = struct.unpack('<BBI', self.ser.read(6))
-      if not (id == self.id):
-        raise ValueError(f"Stage {self.id}: Move response ID mismatch (expected {self.id}, got {id})")
+      self._read_response_for_id(timeout_s=3.0, expected_cmd=20)
 
   def get_pos(self):
     # Clear buffer completely before sending command
     self.ser.reset_input_buffer()
-    self.ser.reset_output_buffer()
-    time.sleep(0.05)  # Give hardware time to clear
-    
+
     msg = struct.pack('BB', self.id, 60) + struct.pack('<I', 0)
     self.ser.write(msg)
     self.ser.flush()  # Ensure write completes
-    time.sleep(0.05)  # Wait for response to arrive
-    
-    # Wait for exact 6 bytes with timeout
-    timeout = time.time() + 2.0
-    while self.ser.inWaiting() < 6:
-      if time.time() > timeout:
-        raise TimeoutError(f"Stage {self.id}: Get position timeout (got {self.ser.inWaiting()} bytes)")
-      time.sleep(0.01)
-    
-    response = self.ser.read(6)
-    id, cmd, val = struct.unpack('<BBI', response)
-    
-    if (id != self.id):
-      # Flush remaining data and show what we got
-      remaining = self.ser.read(self.ser.inWaiting())
-      raise ValueError(f"Stage {self.id}: Get position ID mismatch (expected {self.id}, got {id}). Response: {response.hex()}")
-    
+    _, _, val = self._read_response_for_id(timeout_s=3.0, expected_cmd=60)
     return val*self.step_size
   
 
@@ -131,15 +118,4 @@ class StageModuleControl():
     
     msg = struct.pack('BB', self.id, 36) + struct.pack('<I', 0)
     self.ser.write(msg)
-    time.sleep(0.01)  # Small delay for command to process
-    
-    # Wait for response with timeout
-    timeout = time.time() + 2.0
-    while not self.ser.inWaiting():
-      if time.time() > timeout:
-        raise TimeoutError(f"Stage {self.id}: Set speed timeout")
-      time.sleep(0.001)
-    
-    id, cmd, val = struct.unpack('<BBI', self.ser.read(6))
-    if not (id == self.id):
-      raise ValueError(f"Stage {self.id}: Set speed ID mismatch (expected {self.id}, got {id})")
+    self._read_response_for_id(timeout_s=3.0, expected_cmd=36)

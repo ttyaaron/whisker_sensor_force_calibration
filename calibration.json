@@ -1,0 +1,54 @@
+{
+  "offset": 0.00010732029084465777,
+  "scale": -42294.65845328182,
+  "timestamp": "2026-03-04T18:14:39.705105+00:00",
+  "channel": 0,
+  "notes": "",
+  "gain": 128,
+  "interval_ms": 5,
+  "fit": {
+    "slope": -42294.65845328182,
+    "intercept": 4.539075046381669,
+    "r2": 0.9803613838448815,
+    "equation": "force_N = slope * bridge_value + intercept",
+    "equivalent": "force_N = (bridge_value - offset) * scale"
+  },
+  "points": [
+    {
+      "mass_g": 0.0,
+      "force_N": 0.0,
+      "bridge_value": 0.00010748972417786717,
+      "samples": 400
+    },
+    {
+      "mass_g": 2.0,
+      "force_N": 0.0196133,
+      "bridge_value": 0.00010670582065358758,
+      "samples": 400
+    },
+    {
+      "mass_g": 51.8,
+      "force_N": 0.50798447,
+      "bridge_value": 9.306226391345263e-05,
+      "samples": 400
+    },
+    {
+      "mass_g": 144.3,
+      "force_N": 1.415099595,
+      "bridge_value": 7.882514502853155e-05,
+      "samples": 400
+    },
+    {
+      "mass_g": 137.1,
+      "force_N": 1.344491715,
+      "bridge_value": 7.439863868057727e-05,
+      "samples": 400
+    },
+    {
+      "mass_g": 186.9,
+      "force_N": 1.8328628850000002,
+      "bridge_value": 6.238344823941588e-05,
+      "samples": 400
+    }
+  ]
+}

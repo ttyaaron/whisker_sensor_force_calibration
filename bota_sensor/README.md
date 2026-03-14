@@ -20,9 +20,20 @@ bota_sensor/
 python bota_sensor/visualize_realtime.py
 ```
 
+**Linux一键启动（自动设置网卡与运行库）**：
+```bash
+./run_bota_realtime.sh
+```
+
 **详细视图**（显示所有6个独立分量）：
 ```bash
 python bota_sensor/visualize_detailed.py
+```
+
+如果需要手动指定网卡：
+```bash
+export BOTA_NETWORK_INTERFACE=enp14s0
+python bota_sensor/visualize_realtime.py
 ```
 
 ## 📊 可视化说明

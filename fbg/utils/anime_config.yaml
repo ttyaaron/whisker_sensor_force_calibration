@@ -1,0 +1,30 @@
+data:
+  sampling_rate: 1980  # Hz - adjust if your data has different sampling rate
+  start_time: 0        # seconds - start time for animation
+  end_time: null       # seconds - end time for animation (null = end of data)
+
+animation:
+  window_duration: 8.0  # seconds - how much data to show in sliding window
+  fps: 30              # frames per second for output video
+  speed_factor: 1.0    # playback speed multiplier (1.0 = real time)
+  remove_offset: true  # subtract first value to start plotting from 0
+  normalize_time: true # start time axis from 0 (regardless of selected time range)
+visualization:
+  figure_size: [20, 4]      # [width, height] in inches
+  dpi: 100                  # resolution
+  line_width: 2             # thickness of data line
+  line_color_fbg1: '#2E86AB'  # blue color for FBG1
+  line_color_fbg2: '#A23B72'  # purple color for FBG2
+  background_color: 'white'   # background color
+  grid: true                  # show grid
+  grid_alpha: 0.3            # grid transparency (0-1)
+  title_fontsize: 16         # title font size
+  label_fontsize: 12         # axis label font size
+  tick_fontsize: 10          # tick label font size
+
+output:
+  output_dir: './animations'     # where to save videos
+  filename_prefix: 'fbg_animation'  # prefix for output files
+  format: 'mp4'                  # video format
+  quality: 'high'               # 'low', 'medium', 'high'
+  bitrate: '2000k'              # custom bitrate if needed

@@ -5,6 +5,11 @@ Bota力传感器实时可视化 - 综合视图 (推荐)
 import os
 import time
 import signal
+import json
+import tempfile
+import socket
+import array
+import sys
 import bota_driver
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -13,7 +18,148 @@ import numpy as np
 
 # 配置文件路径
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "..", "bota_driver_py_example", "bota_driver_config", "ethercat_gen0.json")
+DEFAULT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "..", "bota_driver_config", "ethercat_gen0.json")
+CONFIG_PATH = os.environ.get("BOTA_CONFIG_PATH", DEFAULT_CONFIG_PATH)
+
+
+def detect_linux_network_interface():
+    """自动选择Linux网卡名（优先有线网卡）。"""
+    if os.name == "nt":
+        return ""
+
+    net_dir = "/sys/class/net"
+    if not os.path.isdir(net_dir):
+        return ""
+
+    interfaces = []
+    for iface in sorted(os.listdir(net_dir)):
+        if iface == "lo":
+            continue
+        operstate_path = os.path.join(net_dir, iface, "operstate")
+        state = "unknown"
+        if os.path.isfile(operstate_path):
+            with open(operstate_path, "r", encoding="utf-8") as handle:
+                state = handle.read().strip()
+        interfaces.append((iface, state))
+
+    up_eth = [iface for iface, state in interfaces if state == "up" and iface.startswith("en")]
+    if up_eth:
+        return up_eth[0]
+
+    up_any = [iface for iface, state in interfaces if state == "up"]
+    if up_any:
+        return up_any[0]
+
+    eth_any = [iface for iface, _ in interfaces if iface.startswith("en")]
+    if eth_any:
+        return eth_any[0]
+
+    return interfaces[0][0] if interfaces else ""
+
+
+def get_ipv4_addresses(interface_name):
+    """读取指定网卡上的IPv4地址（仅Linux）。"""
+    try:
+        import fcntl
+        import struct
+    except Exception:
+        return []
+
+    ip_addresses = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    max_interfaces = 64
+    bytes_buffer = max_interfaces * 40
+    names = array.array('B', b'\0' * bytes_buffer)
+
+    try:
+        request = struct.pack('iL', bytes_buffer, names.buffer_info()[0])
+        result = fcntl.ioctl(sock.fileno(), 0x8912, request)  # SIOCGIFCONF
+        out_bytes = struct.unpack('iL', result)[0]
+        namestr = names.tobytes()
+        for index in range(0, out_bytes, 40):
+            name = namestr[index:index + 16].split(b'\0', 1)[0].decode('utf-8', errors='ignore')
+            if name != interface_name:
+                continue
+            ip_bytes = namestr[index + 20:index + 24]
+            ip_addresses.append(socket.inet_ntoa(ip_bytes))
+    except Exception:
+        return []
+    finally:
+        sock.close()
+
+    return ip_addresses
+
+
+def linux_preflight_notice(network_interface):
+    """Linux环境启动前检查提示。"""
+    if os.name == "nt":
+        return
+
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("[提示] Linux下EtherCAT通常需要root权限。建议使用: sudo -E ./run_bota_realtime.sh")
+
+    ip_addresses = get_ipv4_addresses(network_interface)
+    if ip_addresses and not any(ip.startswith("10.20.0.") for ip in ip_addresses):
+        print(
+            f"[提示] 网卡 {network_interface} 当前IP: {', '.join(ip_addresses)}，"
+            "与传感器常用网段10.20.0.x不一致。"
+        )
+        print("[提示] 可先设置: sudo ip addr flush dev <网卡>; sudo ip addr add 10.20.0.100/24 dev <网卡>")
+
+
+def prepare_config_path(config_path):
+    """根据操作系统和环境变量准备运行时配置文件路径。"""
+    if not os.path.isfile(config_path):
+        raise RuntimeError(f"配置文件不存在: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as handle:
+        config_data = json.load(handle)
+
+    driver_config = config_data.get("driver_config", {})
+    interface_name = driver_config.get("communication_interface_name", "")
+    interface_params = driver_config.get("communication_interface_params", {})
+    current_iface = interface_params.get("network_interface", "")
+    override_iface = os.environ.get("BOTA_NETWORK_INTERFACE", "").strip()
+    override_sensor_ip = os.environ.get("BOTA_SENSOR_IP", "").strip()
+
+    if override_sensor_ip and "sensor_ip_address" in interface_params:
+        interface_params["sensor_ip_address"] = override_sensor_ip
+        temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+        with temp_file as handle:
+            json.dump(config_data, handle, ensure_ascii=False, indent=4)
+        print(f"使用环境变量 BOTA_SENSOR_IP 覆盖传感器IP: {override_sensor_ip}")
+        return temp_file.name
+
+    is_ethercat = "EtherCAT" in interface_name
+
+    if override_iface and is_ethercat:
+        interface_params["network_interface"] = override_iface
+        linux_preflight_notice(override_iface)
+        temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+        with temp_file as handle:
+            json.dump(config_data, handle, ensure_ascii=False, indent=4)
+        print(f"使用环境变量 BOTA_NETWORK_INTERFACE 覆盖网卡: {override_iface}")
+        return temp_file.name
+
+    if os.name != "nt" and is_ethercat and isinstance(current_iface, str) and current_iface.startswith("\\\\Device\\NPF_"):
+        auto_iface = detect_linux_network_interface()
+        if not auto_iface:
+            raise RuntimeError(
+                "当前是Linux环境，但配置文件中的network_interface是Windows Npcap接口。\n"
+                "请先设置Linux网卡名，例如:\n"
+                "  export BOTA_NETWORK_INTERFACE=enp3s0\n"
+                "可用网卡可用命令查看: ip -br link"
+            )
+
+        interface_params["network_interface"] = auto_iface
+        linux_preflight_notice(auto_iface)
+        temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+        with temp_file as handle:
+            json.dump(config_data, handle, ensure_ascii=False, indent=4)
+        print(f"检测到Linux网卡，自动使用: {auto_iface}")
+        return temp_file.name
+
+    return config_path
 
 # 数据存储
 MAX_POINTS = 500
@@ -44,7 +190,8 @@ def init_sensor():
     print("=" * 60)
     print("初始化Bota力传感器...")
     print("=" * 60)
-    bota_ft_sensor_driver = bota_driver.BotaDriver(CONFIG_PATH)
+    runtime_config_path = prepare_config_path(CONFIG_PATH)
+    bota_ft_sensor_driver = bota_driver.BotaDriver(runtime_config_path)
     
     if not bota_ft_sensor_driver.configure():
         raise RuntimeError("传感器配置失败")
@@ -171,6 +318,7 @@ def update_plot(frame):
         stop_flag = True
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
         init_sensor()
         
@@ -206,6 +354,8 @@ if __name__ == "__main__":
         print("\n收到中断信号...")
     except Exception as e:
         print(f"\n错误: {e}")
+        exit_code = 1
     finally:
         cleanup_sensor()
         print("程序已退出")
+        sys.exit(exit_code)

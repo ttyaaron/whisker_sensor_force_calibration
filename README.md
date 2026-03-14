@@ -126,6 +126,23 @@ pip install bota-driver matplotlib numpy pyserial
    - 子网掩码: `255.255.255.0`
    - 网关: 留空
 
+## 🗂️ Data Policy (GitHub vs Local)
+
+为保证仓库轻量、可复现、便于协作，采用以下数据管理规则：
+
+- **应提交到 GitHub（核心资产）**
+    - 代码与脚本：`*.py`, `*.sh`
+    - 文档：`README*.md`, `QUICKSTART.md`
+    - 配置与标定定义：如 `calibration.json`, `bota_driver_config/`
+
+- **不应提交到 GitHub（本地/产物）**
+    - 原始与批量实验数据：`experiment_data*/`
+    - 绘图与可视化输出：`experiment_plot_*/`, `experiment_plots/`, `calibration_fit*.png|svg`
+    - 本地导出中间数据：`force*.csv`
+    - 环境与缓存：`.venv/`, `__pycache__/`, `*.pyc`
+
+说明：上述规则已在仓库根目录 `.gitignore` 中配置。若已有历史跟踪的大文件/缓存文件，需执行一次 `git rm --cached <path>` 以从版本库索引中移除。
+
 ## 📝 使用注意事项
 
 ### 运行Bota传感器程序前
