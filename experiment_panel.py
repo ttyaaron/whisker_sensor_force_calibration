@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import serial
 import serial.tools.list_ports
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtWidgets, QtGui
 try:
     import pyqtgraph as pg
 except Exception:  # pragma: no cover - optional UI dependency
@@ -33,6 +33,14 @@ except ImportError as exc:  # pragma: no cover - hardware/env specific
     BOTA_IMPORT_ERROR = exc
 else:
     BOTA_IMPORT_ERROR = None
+
+try:
+    import pyrealsense2 as rs
+except Exception as exc:  # pragma: no cover - optional hardware dependency
+    rs = None  # type: ignore[assignment]
+    REALSENSE_IMPORT_ERROR = exc
+else:
+    REALSENSE_IMPORT_ERROR = None
 
 try:
     from read_phidgetbridge_loadcell import (
@@ -235,6 +243,7 @@ class DisplacementResult:
     start_fbg1_nm: float
     end_force_z_n: float
     end_fbg1_nm: float
+    end_image_path: str
     trace_csv_path: str
     summary_table_csv_path: str
 
@@ -540,6 +549,76 @@ class PhidgetForceReader(threading.Thread):
                 pass
 
 
+class RealSenseCapture:
+    def __init__(
+        self,
+        *,
+        serial_number: Optional[str] = None,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+    ) -> None:
+        self.serial_number = (serial_number or "").strip() or None
+        self.width = max(160, int(width))
+        self.height = max(120, int(height))
+        self.fps = max(1, int(fps))
+        self._pipeline = None
+
+    def start(self) -> None:
+        if rs is None:
+            raise RuntimeError(
+                "RealSense support is unavailable: pyrealsense2 import failed. "
+                f"Import error: {REALSENSE_IMPORT_ERROR}"
+            )
+
+        pipeline = rs.pipeline()
+        config = rs.config()
+        if self.serial_number:
+            config.enable_device(self.serial_number)
+        config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
+        pipeline.start(config)
+
+        # Warm up auto exposure/white-balance before first capture.
+        for _ in range(5):
+            pipeline.wait_for_frames(timeout_ms=1200)
+        self._pipeline = pipeline
+
+    def stop(self) -> None:
+        if self._pipeline is None:
+            return
+        try:
+            self._pipeline.stop()
+        except Exception:
+            pass
+        self._pipeline = None
+
+    @staticmethod
+    def _save_png(path: Path, rgb: np.ndarray) -> None:
+        if rgb.ndim != 3 or rgb.shape[2] < 3:
+            raise RuntimeError("Invalid RGB frame shape from RealSense.")
+        image = np.ascontiguousarray(np.asarray(rgb[:, :, :3], dtype=np.uint8))
+        h, w, _ = image.shape
+        qimg = QtGui.QImage(image.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        if qimg.isNull():
+            raise RuntimeError("Failed to construct image buffer for RealSense PNG export.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not qimg.save(str(path), "PNG"):
+            raise RuntimeError(f"Failed to save RealSense image as PNG: {path}")
+
+    def capture_to_file(self, output_path: Path, *, timeout_ms: int = 1500) -> Path:
+        if self._pipeline is None:
+            raise RuntimeError("RealSense camera is not connected.")
+
+        frames = self._pipeline.wait_for_frames(timeout_ms=int(timeout_ms))
+        color = frames.get_color_frame()
+        if not color:
+            raise RuntimeError("RealSense did not return a color frame.")
+
+        rgb = np.asanyarray(color.get_data())
+        self._save_png(output_path, rgb)
+        return output_path
+
+
 class ExperimentController:
     _STAGE_STEP_SIZE_MM = 0.000047625
 
@@ -551,6 +630,7 @@ class ExperimentController:
         bota_interface_override: Optional[str],
         fbg_interrogator_cfg: InterrogatorSettings,
         stage_module_id: int = 1,
+        y_stage_module_id: int = 2,
         z_stage_module_id: int = 3,
         z_total_steps: int = 1066666,
         invert_z_axis: bool = False,
@@ -564,12 +644,18 @@ class ExperimentController:
         loadcell_serial: Optional[int] = None,
         loadcell_calibration_path: Optional[Path] = None,
         loadcell_attach_timeout_s: float = 5.0,
+        enable_realsense: bool = False,
+        realsense_serial: str = "",
+        realsense_width: int = 640,
+        realsense_height: int = 480,
+        realsense_fps: int = 30,
     ) -> None:
         self.output_dir = output_dir
         self.bota_config_path = bota_config_path
         self.bota_interface_override = (bota_interface_override or "").strip() or None
         self.fbg_interrogator_cfg = fbg_interrogator_cfg
         self.stage_module_id = int(stage_module_id)
+        self.y_stage_module_id = int(y_stage_module_id)
         self.z_stage_module_id = int(z_stage_module_id)
         self.z_total_steps = int(z_total_steps)
         self.invert_z_axis = bool(invert_z_axis)
@@ -587,9 +673,15 @@ class ExperimentController:
             else ROOT_DIR / "calibration.json"
         )
         self.loadcell_attach_timeout_s = max(0.2, float(loadcell_attach_timeout_s))
+        self.enable_realsense = bool(enable_realsense)
+        self.realsense_serial = (realsense_serial or "").strip() or None
+        self.realsense_width = max(160, int(realsense_width))
+        self.realsense_height = max(120, int(realsense_height))
+        self.realsense_fps = max(1, int(realsense_fps))
 
         self._stage_serial: Optional[serial.Serial] = None
         self._stage_x: Optional[StageModuleControl] = None
+        self._stage_y: Optional[StageModuleControl] = None
         self._stage_z: Optional[StageModuleControl] = None
         self._stage_lock = threading.Lock()
         self._x_state_lock = threading.Lock()
@@ -598,6 +690,9 @@ class ExperimentController:
         self._latest_x_mm = float("nan")
         self._latest_x_error = ""
         self._latest_x_timestamp = 0.0
+        self._latest_y_mm = float("nan")
+        self._latest_y_error = ""
+        self._latest_y_timestamp = 0.0
         self._latest_z_mm = float("nan")
         self._latest_z_error = ""
         self._latest_z_timestamp = 0.0
@@ -606,6 +701,7 @@ class ExperimentController:
 
         self._force_reader: Optional[Union[BotaForceReader, PhidgetForceReader]] = None
         self._fbg_reader: Optional[FBGStreamReader] = None
+        self._realsense_camera: Optional[RealSenseCapture] = None
 
     @staticmethod
     def _stage_total_steps(module_id: int) -> int:
@@ -638,9 +734,19 @@ class ExperimentController:
 
     @property
     def is_connected(self) -> bool:
+        """True if the minimum required hardware (stage X) is connected.
+
+        Optional peripherals (FBG, force reader, camera, Y/Z stages) may
+        connect later or remain disconnected without blocking operation.
+        """
         force_required = self.enable_bota or self.enable_loadcell
         force_ok = (self._force_reader is not None) or (not force_required)
-        return self._stage_x is not None and force_ok and self._fbg_reader is not None
+        camera_ok = (self._realsense_camera is not None) or (not self.enable_realsense)
+        return (
+            self._stage_x is not None
+            and force_ok
+            and camera_ok
+        )
 
     def set_invert_z_axis(self, enabled: bool) -> None:
         self.invert_z_axis = bool(enabled)
@@ -771,6 +877,9 @@ class ExperimentController:
         if self.is_connected:
             return
 
+        if len({int(self.stage_module_id), int(self.y_stage_module_id), int(self.z_stage_module_id)}) != 3:
+            raise RuntimeError("X/Y/Z Stage IDs must all be different.")
+
         candidates = self.list_stage_port_candidates()
         if stage_port:
             preferred = stage_port.strip()
@@ -840,6 +949,18 @@ class ExperimentController:
         try:
             self._stage_serial = stage_serial
             self._stage_x = stage_x
+            self._stage_y = None
+            # Y axis is optional at startup; connect lazily when Y is first used.
+            try:
+                candidate_y = self._build_stage_module(self.y_stage_module_id, is_z_axis=False)
+                self._run_stage_call("connect_y/get_pos", lambda: candidate_y.get_pos(), retries=3)
+                self._stage_y = candidate_y
+                with self._x_state_lock:
+                    self._latest_y_error = ""
+            except Exception as exc:
+                with self._x_state_lock:
+                    self._latest_y_error = str(exc)
+                print(f"[warn] Y stage not connected at startup (ID {self.y_stage_module_id}): {exc}")
             self._stage_z = None
             self._start_x_reader()
 
@@ -852,25 +973,54 @@ class ExperimentController:
             else:
                 self._force_reader = None
 
-            fbg_reader = FBGStreamReader(self.fbg_interrogator_cfg, history_seconds=10.0)
-            self._fbg_reader = fbg_reader
-            fbg_reader.start()
-            if not fbg_reader.wait_until_ready(timeout=8.0):
-                cfg = self.fbg_interrogator_cfg
-                detail = (fbg_reader.error or "").strip()
-                if detail:
-                    raise RuntimeError(
-                        "FBG interrogator connection failed: "
-                        f"{detail} (target {cfg.ip_address}:{cfg.port})"
-                    )
-                raise RuntimeError(
-                    "Timeout waiting for FBG interrogator connection "
-                    f"(target {cfg.ip_address}:{cfg.port}). "
-                    "Check interrogator power/cable/IP, and ensure no other app is connected."
-                )
+            try:
+                fbg_reader = FBGStreamReader(self.fbg_interrogator_cfg, history_seconds=10.0)
+                fbg_reader.start()
+                if not fbg_reader.wait_until_ready(timeout=8.0):
+                    cfg = self.fbg_interrogator_cfg
+                    detail = (fbg_reader.error or "").strip()
+                    if detail:
+                        msg = (
+                            f"FBG interrogator connection failed: "
+                            f"{detail} (target {cfg.ip_address}:{cfg.port})"
+                        )
+                    else:
+                        msg = (
+                            f"Timeout waiting for FBG interrogator connection "
+                            f"(target {cfg.ip_address}:{cfg.port}). "
+                            "Check interrogator power/cable/IP, and ensure no other app is connected."
+                        )
+                    fbg_reader.stop()
+                    raise RuntimeError(msg)
+                self._fbg_reader = fbg_reader
+            except Exception as exc:
+                print(f"[warn] FBG interrogator not connected: {exc}")
+                self._fbg_reader = None
+
+            if self.enable_realsense:
+                try:
+                    self._realsense_camera = self._connect_realsense_camera()
+                except Exception as exc:
+                    print(f"[warn] RealSense camera not connected: {exc}")
+                    self._realsense_camera = None
         except Exception:
             self.disconnect()
             raise
+
+    def _connect_realsense_camera(self) -> RealSenseCapture:
+        camera = RealSenseCapture(
+            serial_number=self.realsense_serial,
+            width=self.realsense_width,
+            height=self.realsense_height,
+            fps=self.realsense_fps,
+        )
+        camera.start()
+        return camera
+
+    def capture_realsense_image(self, output_path: Path) -> Path:
+        if self._realsense_camera is None:
+            raise RuntimeError("RealSense camera is not connected.")
+        return self._realsense_camera.capture_to_file(output_path)
 
     def _bota_config_candidates(self) -> List[Path]:
         candidates: List[Path] = []
@@ -998,6 +1148,10 @@ class ExperimentController:
             self._fbg_reader.stop()
             self._fbg_reader = None
 
+        if self._realsense_camera is not None:
+            self._realsense_camera.stop()
+            self._realsense_camera = None
+
         if self._force_reader is not None:
             self._force_reader.stop()
             self._force_reader = None
@@ -1009,11 +1163,15 @@ class ExperimentController:
             finally:
                 self._stage_serial = None
                 self._stage_x = None
+                self._stage_y = None
                 self._stage_z = None
         with self._x_state_lock:
             self._latest_x_mm = float("nan")
             self._latest_x_error = ""
             self._latest_x_timestamp = 0.0
+            self._latest_y_mm = float("nan")
+            self._latest_y_error = ""
+            self._latest_y_timestamp = 0.0
             self._latest_z_mm = float("nan")
             self._latest_z_error = ""
             self._latest_z_timestamp = 0.0
@@ -1032,6 +1190,14 @@ class ExperimentController:
                     with self._stage_lock:
                         value = self._run_stage_call("get_pos", lambda: self._stage_x.get_pos(), retries=1)
                         x_mm = float(value) if value is not None else float("nan")
+                        y_mm = float("nan")
+                        y_error = ""
+                        if self._stage_y is not None:
+                            try:
+                                value_y = self._run_stage_call("get_pos_y", lambda: self._stage_y.get_pos(), retries=1)
+                                y_mm = float(value_y) if value_y is not None else float("nan")
+                            except Exception as exc:
+                                y_error = str(exc)
                         z_mm = float("nan")
                         z_error = ""
                         if self._stage_z is not None:
@@ -1045,6 +1211,10 @@ class ExperimentController:
                         self._latest_x_mm = x_mm
                         self._latest_x_error = ""
                         self._latest_x_timestamp = time.perf_counter()
+                        if self._stage_y is not None:
+                            self._latest_y_mm = y_mm
+                            self._latest_y_error = y_error
+                            self._latest_y_timestamp = time.perf_counter()
                         if self._stage_z is not None:
                             self._latest_z_mm = z_mm
                             self._latest_z_error = z_error
@@ -1067,6 +1237,8 @@ class ExperimentController:
         module_id = int(module_id)
         if module_id not in (1, 2, 3):
             raise ValueError(f"Invalid stage module id: {module_id}")
+        if module_id == self.y_stage_module_id:
+            raise ValueError("X Stage ID and Y Stage ID must be different.")
         if module_id == self.z_stage_module_id:
             raise ValueError("X Stage ID and Z Stage ID must be different.")
 
@@ -1086,12 +1258,52 @@ class ExperimentController:
             self._run_stage_call("switch_stage_id/get_pos", lambda: candidate.get_pos(), retries=3)
             self._stage_x = candidate
 
+    def set_y_stage_module_id(self, module_id: int) -> None:
+        module_id = int(module_id)
+        if module_id not in (1, 2, 3):
+            raise ValueError(f"Invalid Y stage module id: {module_id}")
+        if module_id == self.stage_module_id:
+            raise ValueError("X Stage ID and Y Stage ID must be different.")
+        if module_id == self.z_stage_module_id:
+            raise ValueError("Y Stage ID and Z Stage ID must be different.")
+
+        self.y_stage_module_id = module_id
+
+        if self._stage_serial is None:
+            self._stage_y = None
+            return
+
+        with self._stage_lock:
+            candidate = self._build_stage_module(module_id, is_z_axis=False)
+            self._run_stage_call("switch_y_stage_id/get_pos", lambda: candidate.get_pos(), retries=3)
+            self._stage_y = candidate
+
+    def _ensure_stage_y(self) -> StageModuleControl:
+        if self._stage_serial is None:
+            raise RuntimeError("Stage is not connected")
+        if self.y_stage_module_id == self.stage_module_id:
+            raise RuntimeError("X Stage ID and Y Stage ID must be different.")
+        if self.y_stage_module_id == self.z_stage_module_id:
+            raise RuntimeError("Y Stage ID and Z Stage ID must be different.")
+        if self._stage_y is not None:
+            return self._stage_y
+
+        with self._stage_lock:
+            candidate = self._build_stage_module(self.y_stage_module_id, is_z_axis=False)
+            self._run_stage_call("connect_y/get_pos", lambda: candidate.get_pos(), retries=3)
+            self._stage_y = candidate
+        with self._x_state_lock:
+            self._latest_y_error = ""
+        return candidate
+
     def set_z_stage_module_id(self, module_id: int) -> None:
         module_id = int(module_id)
         if module_id not in (1, 2, 3):
             raise ValueError(f"Invalid Z stage module id: {module_id}")
         if module_id == self.stage_module_id:
             raise ValueError("X Stage ID and Z Stage ID must be different.")
+        if module_id == self.y_stage_module_id:
+            raise ValueError("Y Stage ID and Z Stage ID must be different.")
 
         self.z_stage_module_id = module_id
 
@@ -1118,6 +1330,8 @@ class ExperimentController:
             raise RuntimeError("Stage is not connected")
         if self.z_stage_module_id == self.stage_module_id:
             raise RuntimeError("X Stage ID and Z Stage ID must be different.")
+        if self.z_stage_module_id == self.y_stage_module_id:
+            raise RuntimeError("Y Stage ID and Z Stage ID must be different.")
         if self._stage_z is not None:
             return self._stage_z
 
@@ -1139,14 +1353,23 @@ class ExperimentController:
         with self._stage_lock:
             self._run_stage_call("home", lambda: self._stage_x.home(), retries=3)
 
+    def home_y(self) -> None:
+        stage_y = self._ensure_stage_y()
+        with self._stage_lock:
+            self._run_stage_call("home_y", lambda: stage_y.home(skip_response_wait=True), retries=3)
+
     def home_z(self) -> None:
         if not self.invert_z_axis:
             stage_z = self._ensure_stage_z()
-            with self._stage_lock:
-                self._run_stage_call("home_z", lambda: stage_z.home(), retries=3)
-            return
+            try:
+                with self._stage_lock:
+                    self._run_stage_call("home_z", lambda: stage_z.home(), retries=3)
+                return
+            except Exception as exc:
+                # Some controllers/axes do not ACK CMD=1 consistently. Fallback to software home.
+                print(f"[warn] Hardware Z home failed ({exc}); falling back to software home to Z=0.")
 
-        # Reversed axis: use software home so "Home Z" still maps to user Z=0.
+        # Reversed axis or hardware-home fallback: use software home so "Home Z" maps to user Z=0.
         self.move_z_to_mm(
             0.0,
             tolerance_mm=0.02,
@@ -1161,6 +1384,72 @@ class ExperimentController:
             value = self._run_stage_call("get_pos", lambda: self._stage_x.get_pos(), retries=3)
             assert value is not None
             return float(value)
+
+    def get_y_position_mm(self) -> float:
+        stage_y = self._ensure_stage_y()
+        with self._stage_lock:
+            value = self._run_stage_call("get_pos_y", lambda: stage_y.get_pos(), retries=3)
+            assert value is not None
+            return float(value)
+
+    def move_x_to_mm(
+        self,
+        target_mm: float,
+        *,
+        tolerance_mm: float,
+        poll_interval_s: float,
+        max_wait_s: float,
+        abort_event: Optional[threading.Event] = None,
+    ) -> float:
+        if self._stage_x is None:
+            raise RuntimeError("Stage is not connected")
+        with self._stage_lock:
+            self._run_stage_call(
+                "move_x",
+                lambda: self._stage_x.go_pos_mm(float(target_mm), wait=False),
+                retries=3,
+            )
+        deadline = time.perf_counter() + max(1.0, float(max_wait_s))
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError("aborted")
+            x_now = self.get_x_position_mm()
+            if abs(x_now - float(target_mm)) <= float(tolerance_mm):
+                return x_now
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(
+                    f"move_x timeout: target={float(target_mm):.4f} mm, latest={x_now:.4f} mm"
+                )
+            time.sleep(max(0.01, float(poll_interval_s)))
+
+    def move_y_to_mm(
+        self,
+        target_mm: float,
+        *,
+        tolerance_mm: float,
+        poll_interval_s: float,
+        max_wait_s: float,
+        abort_event: Optional[threading.Event] = None,
+    ) -> float:
+        stage_y = self._ensure_stage_y()
+        with self._stage_lock:
+            self._run_stage_call(
+                "move_y",
+                lambda: stage_y.go_pos_mm(float(target_mm), wait=False),
+                retries=3,
+            )
+        deadline = time.perf_counter() + max(1.0, float(max_wait_s))
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError("aborted")
+            y_now = self.get_y_position_mm()
+            if abs(y_now - float(target_mm)) <= float(tolerance_mm):
+                return y_now
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(
+                    f"move_y timeout: target={float(target_mm):.4f} mm, latest={y_now:.4f} mm"
+                )
+            time.sleep(max(0.01, float(poll_interval_s)))
 
     def get_z_position_mm(self) -> float:
         stage_z = self._ensure_stage_z()
@@ -1247,6 +1536,8 @@ class ExperimentController:
             with self._x_state_lock:
                 snapshot["x_mm"] = float(self._latest_x_mm)
                 snapshot["x_read_error"] = str(self._latest_x_error)
+                snapshot["y_mm"] = float(self._latest_y_mm)
+                snapshot["y_read_error"] = str(self._latest_y_error)
                 snapshot["z_mm"] = float(self._latest_z_mm)
                 snapshot["z_read_error"] = str(self._latest_z_error)
         return snapshot
@@ -1254,6 +1545,10 @@ class ExperimentController:
     def latest_z_position_mm(self) -> float:
         with self._x_state_lock:
             return float(self._latest_z_mm)
+
+    def latest_y_position_mm(self) -> float:
+        with self._x_state_lock:
+            return float(self._latest_y_mm)
 
     def get_fbg_history(self, max_points: int = 1500) -> Tuple[np.ndarray, np.ndarray]:
         if self._fbg_reader is None or not self._fbg_reader.is_ready:
@@ -1693,13 +1988,16 @@ class ExperimentController:
         def _capture_average_stationary(
             phase_prefix: str,
             expected_x: float,
-        ) -> Tuple[Dict[str, float], float, Optional[str]]:
+            *,
+            capture_image_path: Optional[Path] = None,
+        ) -> Tuple[Dict[str, float], float, Optional[str], str]:
             window_s = max(0.05, float(config.snapshot_avg_window_s))
             stability_span_limit = max(0.002, float(config.position_tolerance_mm) * 2.0)
             max_attempt_s = max(2.0, float(config.max_move_wait_s))
             attempt_deadline = time.perf_counter() + max_attempt_s
             last_avg_x = float("nan")
             last_snapshot = self._capture_sensor_snapshot()
+            image_path_str = ""
 
             while True:
                 x_samples: List[float] = []
@@ -1707,12 +2005,25 @@ class ExperimentController:
                 fbg1_samples: List[float] = []
 
                 window_deadline = time.perf_counter() + window_s
+                capture_deadline = time.perf_counter() + 0.5 * window_s
                 while True:
                     if abort_event.is_set():
-                        return last_snapshot, float(last_avg_x), "aborted"
+                        return last_snapshot, float(last_avg_x), "aborted", image_path_str
                     x_now = self.get_x_position_mm()
                     snap_now = self._capture_sensor_snapshot()
                     _append_trace(f"{phase_prefix}_avg_window", x_now, snap_now)
+
+                    if (
+                        capture_image_path is not None
+                        and not image_path_str
+                        and self.enable_realsense
+                        and (time.perf_counter() >= capture_deadline)
+                    ):
+                        try:
+                            captured_path = self.capture_realsense_image(capture_image_path)
+                            image_path_str = str(captured_path)
+                        except Exception as exc:
+                            print(f"[warn] RealSense capture failed during {phase_prefix}: {exc}")
 
                     if np.isfinite(x_now):
                         x_samples.append(float(x_now))
@@ -1740,10 +2051,10 @@ class ExperimentController:
                 is_stationary = x_span <= stability_span_limit
 
                 if is_stationary and near_target:
-                    return avg_snapshot, avg_x, None
+                    return avg_snapshot, avg_x, None, image_path_str
 
                 if time.perf_counter() >= attempt_deadline:
-                    return avg_snapshot, avg_x, None
+                    return avg_snapshot, avg_x, None, image_path_str
 
                 if config.settle_time_s > 0:
                     time.sleep(config.settle_time_s)
@@ -1757,6 +2068,7 @@ class ExperimentController:
         end_x = initial_x
         end_z = initial_z
         end_snapshot = initial_snapshot
+        end_image_path = ""
 
         if abort_event.is_set():
             stop_reason = "aborted"
@@ -1775,7 +2087,10 @@ class ExperimentController:
                 if config.settle_time_s > 0:
                     time.sleep(config.settle_time_s)
 
-                start_snapshot, averaged_start_x, reason = _capture_average_stationary("start_reached", requested_start_x)
+                start_snapshot, averaged_start_x, reason, _ = _capture_average_stationary(
+                    "start_reached",
+                    requested_start_x,
+                )
                 if reason is not None:
                     stop_reason = reason
                 start_x = float(averaged_start_x) if np.isfinite(averaged_start_x) else self.get_x_position_mm()
@@ -1801,7 +2116,12 @@ class ExperimentController:
                     if reason is not None:
                         stop_reason = reason
 
-                end_snapshot, averaged_end_x, reason = _capture_average_stationary("end_reached", requested_end_x)
+                image_name = f"{trial_id}_end_avg.png"
+                end_snapshot, averaged_end_x, reason, end_image_path = _capture_average_stationary(
+                    "end_reached",
+                    requested_end_x,
+                    capture_image_path=(trial_dir / image_name) if self.enable_realsense else None,
+                )
                 if reason is not None:
                     stop_reason = reason
                 end_x = float(averaged_end_x) if np.isfinite(averaged_end_x) else self.get_x_position_mm()
@@ -1848,6 +2168,7 @@ class ExperimentController:
             start_fbg1_nm=float(start_snapshot["fbg1_nm"]),
             end_force_z_n=float(end_snapshot["force_z_n"]),
             end_fbg1_nm=float(end_snapshot["fbg1_nm"]),
+            end_image_path=str(end_image_path),
             trace_csv_path=str(trace_path),
             summary_table_csv_path="",
         )
@@ -1887,6 +2208,7 @@ class ExperimentController:
             "end_z_mm",
             "fbg1_displacement_nm",
             "force_change_n",
+            "end_image_path",
         ]
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1905,6 +2227,7 @@ class ExperimentController:
                         "end_z_mm": float(result.end_z_mm),
                         "fbg1_displacement_nm": float(result.end_fbg1_nm - result.start_fbg1_nm),
                         "force_change_n": float(result.end_force_z_n - result.start_force_z_n),
+                        "end_image_path": str(result.end_image_path),
                     }
                 )
         return path
@@ -1929,6 +2252,7 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         self._rezero_thread: Optional[threading.Thread] = None
         self._abort_event = threading.Event()
         self._setting_stage_id = False
+        self._setting_y_stage_id = False
         self._setting_z_stage_id = False
         self._loadcell_rezero_window_s = 1.5
         self._fbg_plot_window_s = 20.0
@@ -1950,7 +2274,7 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         if not initial_stage_port:
             initial_stage_port = self.controller.find_stage_port() or ""
 
-        self.setWindowTitle("Whisker X/Z-Displacement Experiment Panel")
+        self.setWindowTitle("Whisker XYZ-Displacement Experiment Panel")
         self.resize(900, 600)
 
         self._build_ui(initial_stage_port, initial_whisker_name)
@@ -1975,6 +2299,10 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         self.stage_id_spin.setRange(1, 3)
         self.stage_id_spin.setValue(int(self.controller.stage_module_id))
         self.stage_id_spin.valueChanged.connect(self._on_stage_id_changed)
+        self.y_stage_id_spin = QtWidgets.QSpinBox()
+        self.y_stage_id_spin.setRange(1, 3)
+        self.y_stage_id_spin.setValue(int(self.controller.y_stage_module_id))
+        self.y_stage_id_spin.valueChanged.connect(self._on_y_stage_id_changed)
         self.z_stage_id_spin = QtWidgets.QSpinBox()
         self.z_stage_id_spin.setRange(1, 3)
         self.z_stage_id_spin.setValue(int(self.controller.z_stage_module_id))
@@ -1992,12 +2320,14 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         conn_layout.addWidget(self.stage_port_edit, 0, 1)
         conn_layout.addWidget(QtWidgets.QLabel("X Stage ID"), 0, 2)
         conn_layout.addWidget(self.stage_id_spin, 0, 3)
-        conn_layout.addWidget(QtWidgets.QLabel("Z Stage ID"), 0, 4)
-        conn_layout.addWidget(self.z_stage_id_spin, 0, 5)
+        conn_layout.addWidget(QtWidgets.QLabel("Y Stage ID"), 0, 4)
+        conn_layout.addWidget(self.y_stage_id_spin, 0, 5)
+        conn_layout.addWidget(QtWidgets.QLabel("Z Stage ID"), 0, 6)
+        conn_layout.addWidget(self.z_stage_id_spin, 0, 7)
         conn_layout.addWidget(QtWidgets.QLabel("Output Directory"), 1, 0)
-        conn_layout.addWidget(self.output_dir_edit, 1, 1, 1, 4)
-        conn_layout.addWidget(browse_btn, 1, 5)
-        conn_layout.addWidget(self.invert_z_check, 2, 4, 1, 2)
+        conn_layout.addWidget(self.output_dir_edit, 1, 1, 1, 6)
+        conn_layout.addWidget(browse_btn, 1, 7)
+        conn_layout.addWidget(self.invert_z_check, 2, 6, 1, 2)
         layout.addWidget(conn_group)
 
         disp_group = QtWidgets.QGroupBox("Displacement Control")
@@ -2050,6 +2380,7 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         live_layout = QtWidgets.QGridLayout(live_group)
         self.force_label = QtWidgets.QLabel("nan")
         self.x_label = QtWidgets.QLabel("nan")
+        self.y_label = QtWidgets.QLabel("nan")
         self.z_label = QtWidgets.QLabel("nan")
         self.fbg1_label = QtWidgets.QLabel("nan")
         self.status_label = QtWidgets.QLabel("Disconnected")
@@ -2066,15 +2397,64 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         live_layout.addWidget(self.zero_force_btn, 0, 2, 1, 2)
         live_layout.addWidget(QtWidgets.QLabel("X Position (mm)"), 1, 0)
         live_layout.addWidget(self.x_label, 1, 1)
-        live_layout.addWidget(QtWidgets.QLabel("Z Position (mm)"), 1, 2)
-        live_layout.addWidget(self.z_label, 1, 3)
+        live_layout.addWidget(QtWidgets.QLabel("Y Position (mm)"), 1, 2)
+        live_layout.addWidget(self.y_label, 1, 3)
+        live_layout.addWidget(QtWidgets.QLabel("Z Position (mm)"), 1, 4)
+        live_layout.addWidget(self.z_label, 1, 5)
         live_layout.addWidget(QtWidgets.QLabel("FBG1 (nm)"), 2, 0)
         live_layout.addWidget(self.fbg1_label, 2, 1)
         live_layout.addWidget(QtWidgets.QLabel("Status"), 3, 0)
-        live_layout.addWidget(self.status_label, 3, 1, 1, 3)
+        live_layout.addWidget(self.status_label, 3, 1, 1, 5)
         live_layout.addWidget(QtWidgets.QLabel("Last Trial"), 4, 0)
-        live_layout.addWidget(self.last_result_label, 4, 1, 1, 3)
+        live_layout.addWidget(self.last_result_label, 4, 1, 1, 5)
         layout.addWidget(live_group)
+
+        manual_group = QtWidgets.QGroupBox("Manual XYZ Move")
+        manual_layout = QtWidgets.QGridLayout(manual_group)
+        xy_max_mm = 101.6
+        self.manual_x_target_spin = self._make_spin(0.0, xy_max_mm, 0.0, decimals=3, step=0.1)
+        self.manual_y_target_spin = self._make_spin(0.0, xy_max_mm, 0.0, decimals=3, step=0.1)
+        self.manual_z_target_spin = self._make_spin(0.0, z_max_mm, 0.0, decimals=3, step=0.1)
+        self.manual_jog_step_spin = self._make_spin(0.001, 20.0, 1.0, decimals=3, step=0.1)
+
+        self.move_x_btn = QtWidgets.QPushButton("Move X")
+        self.move_y_btn = QtWidgets.QPushButton("Move Y")
+        self.move_z_btn = QtWidgets.QPushButton("Move Z")
+        self.jog_x_neg_btn = QtWidgets.QPushButton("X -")
+        self.jog_x_pos_btn = QtWidgets.QPushButton("X +")
+        self.jog_y_neg_btn = QtWidgets.QPushButton("Y -")
+        self.jog_y_pos_btn = QtWidgets.QPushButton("Y +")
+        self.jog_z_neg_btn = QtWidgets.QPushButton("Z -")
+        self.jog_z_pos_btn = QtWidgets.QPushButton("Z +")
+
+        self.move_x_btn.clicked.connect(lambda: self._on_move_axis_absolute("x"))
+        self.move_y_btn.clicked.connect(lambda: self._on_move_axis_absolute("y"))
+        self.move_z_btn.clicked.connect(lambda: self._on_move_axis_absolute("z"))
+        self.jog_x_neg_btn.clicked.connect(lambda: self._on_jog_axis("x", -1.0))
+        self.jog_x_pos_btn.clicked.connect(lambda: self._on_jog_axis("x", +1.0))
+        self.jog_y_neg_btn.clicked.connect(lambda: self._on_jog_axis("y", -1.0))
+        self.jog_y_pos_btn.clicked.connect(lambda: self._on_jog_axis("y", +1.0))
+        self.jog_z_neg_btn.clicked.connect(lambda: self._on_jog_axis("z", -1.0))
+        self.jog_z_pos_btn.clicked.connect(lambda: self._on_jog_axis("z", +1.0))
+
+        manual_layout.addWidget(QtWidgets.QLabel("Jog Step (mm)"), 0, 0)
+        manual_layout.addWidget(self.manual_jog_step_spin, 0, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("X Target (mm)"), 1, 0)
+        manual_layout.addWidget(self.manual_x_target_spin, 1, 1)
+        manual_layout.addWidget(self.jog_x_neg_btn, 1, 2)
+        manual_layout.addWidget(self.jog_x_pos_btn, 1, 3)
+        manual_layout.addWidget(self.move_x_btn, 1, 4)
+        manual_layout.addWidget(QtWidgets.QLabel("Y Target (mm)"), 2, 0)
+        manual_layout.addWidget(self.manual_y_target_spin, 2, 1)
+        manual_layout.addWidget(self.jog_y_neg_btn, 2, 2)
+        manual_layout.addWidget(self.jog_y_pos_btn, 2, 3)
+        manual_layout.addWidget(self.move_y_btn, 2, 4)
+        manual_layout.addWidget(QtWidgets.QLabel("Z Target (mm)"), 3, 0)
+        manual_layout.addWidget(self.manual_z_target_spin, 3, 1)
+        manual_layout.addWidget(self.jog_z_neg_btn, 3, 2)
+        manual_layout.addWidget(self.jog_z_pos_btn, 3, 3)
+        manual_layout.addWidget(self.move_z_btn, 3, 4)
+        layout.addWidget(manual_group)
 
         plot_group = QtWidgets.QGroupBox("Live Plots")
         plot_layout = QtWidgets.QVBoxLayout(plot_group)
@@ -2120,18 +2500,34 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         button_row = QtWidgets.QHBoxLayout()
         self.connect_btn = QtWidgets.QPushButton("Connect")
         self.home_btn = QtWidgets.QPushButton("Home X")
+        self.home_y_btn = QtWidgets.QPushButton("Home Y")
         self.home_z_btn = QtWidgets.QPushButton("Home Z")
         self.probe_btn = QtWidgets.QPushButton("Probe IDs")
         self.start_btn = QtWidgets.QPushButton("Start Displacement")
         self.abort_btn = QtWidgets.QPushButton("Abort")
         self.abort_btn.setEnabled(False)
         self.home_btn.setEnabled(False)
+        self.home_y_btn.setEnabled(False)
         self.home_z_btn.setEnabled(False)
         self.probe_btn.setEnabled(False)
         self.start_btn.setEnabled(False)
 
+        for btn in (
+            self.move_x_btn,
+            self.move_y_btn,
+            self.move_z_btn,
+            self.jog_x_neg_btn,
+            self.jog_x_pos_btn,
+            self.jog_y_neg_btn,
+            self.jog_y_pos_btn,
+            self.jog_z_neg_btn,
+            self.jog_z_pos_btn,
+        ):
+            btn.setEnabled(False)
+
         self.connect_btn.clicked.connect(self._on_connect_clicked)
         self.home_btn.clicked.connect(self._on_home_clicked)
+        self.home_y_btn.clicked.connect(self._on_home_y_clicked)
         self.home_z_btn.clicked.connect(self._on_home_z_clicked)
         self.probe_btn.clicked.connect(self._on_probe_clicked)
         self.start_btn.clicked.connect(self._on_start_clicked)
@@ -2140,6 +2536,7 @@ class ExperimentPanel(QtWidgets.QMainWindow):
 
         button_row.addWidget(self.connect_btn)
         button_row.addWidget(self.home_btn)
+        button_row.addWidget(self.home_y_btn)
         button_row.addWidget(self.home_z_btn)
         button_row.addWidget(self.probe_btn)
         button_row.addWidget(self.start_btn)
@@ -2189,17 +2586,21 @@ class ExperimentPanel(QtWidgets.QMainWindow):
             self.zero_force_btn.setEnabled(False)
             self.stage_port_edit.setEnabled(True)
             self.stage_id_spin.setEnabled(True)
+            self.y_stage_id_spin.setEnabled(True)
             self.z_stage_id_spin.setEnabled(True)
+            self._set_manual_motion_enabled(False)
             return
 
         output_dir = Path(self.output_dir_edit.text().strip() or self.controller.output_dir)
         self.controller.output_dir = output_dir
         x_stage_id = int(self.stage_id_spin.value())
+        y_stage_id = int(self.y_stage_id_spin.value())
         z_stage_id = int(self.z_stage_id_spin.value())
-        if x_stage_id == z_stage_id:
-            QtWidgets.QMessageBox.warning(self, "Stage IDs", "X Stage ID and Z Stage ID must be different.")
+        if len({x_stage_id, y_stage_id, z_stage_id}) != 3:
+            QtWidgets.QMessageBox.warning(self, "Stage IDs", "X/Y/Z Stage IDs must all be different.")
             return
         self.controller.stage_module_id = x_stage_id
+        self.controller.y_stage_module_id = y_stage_id
         self.controller.z_stage_module_id = z_stage_id
         self.controller.set_invert_z_axis(bool(self.invert_z_check.isChecked()))
         stage_port = self.stage_port_edit.text().strip()
@@ -2214,21 +2615,29 @@ class ExperimentPanel(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
             self.controller.connect(stage_port=stage_port)
         except Exception as exc:
-            self.status_label.setText("Connection failed")
+            err_text = str(exc).strip() or type(exc).__name__
+            self.status_label.setText(f"Connection failed: {err_text}")
+            print(f"[ExperimentPanel] Connection failed: {err_text}")
             QtWidgets.QMessageBox.critical(self, "Connection Error", str(exc))
             return
 
         self.connect_btn.setText("Disconnect")
         self.home_btn.setEnabled(True)
+        self.home_y_btn.setEnabled(True)
         self.home_z_btn.setEnabled(True)
         self.probe_btn.setEnabled(True)
         self.start_btn.setEnabled(True)
         self.zero_force_btn.setEnabled(self.controller.enable_loadcell)
+        self._set_manual_motion_enabled(True)
         self.stage_port_edit.setEnabled(False)
         self.stage_id_spin.setEnabled(True)
+        self.y_stage_id_spin.setEnabled(True)
         self.z_stage_id_spin.setEnabled(True)
         self.status_label.setText(
-            f"Connected (X Stage ID {self.controller.stage_module_id}, Z Stage ID {self.controller.z_stage_module_id})"
+            "Connected "
+            f"(X Stage ID {self.controller.stage_module_id}, "
+            f"Y Stage ID {self.controller.y_stage_module_id}, "
+            f"Z Stage ID {self.controller.z_stage_module_id})"
         )
         self._reset_fbg_plot_buffers(clear_curve=True)
         self._reset_force_plot_buffers(clear_curve=True)
@@ -2246,7 +2655,10 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         try:
             self.controller.set_stage_module_id(int(value))
             self.status_label.setText(
-                f"Connected (X Stage ID {self.controller.stage_module_id}, Z Stage ID {self.controller.z_stage_module_id})"
+                "Connected "
+                f"(X Stage ID {self.controller.stage_module_id}, "
+                f"Y Stage ID {self.controller.y_stage_module_id}, "
+                f"Z Stage ID {self.controller.z_stage_module_id})"
             )
         except Exception as exc:
             self._setting_stage_id = True
@@ -2258,6 +2670,35 @@ class ExperimentPanel(QtWidgets.QMainWindow):
                 self,
                 "Stage ID Switch Failed",
                 f"Failed to switch Stage ID to {value}:\n{exc}",
+            )
+
+    def _on_y_stage_id_changed(self, value: int) -> None:
+        if self._setting_y_stage_id:
+            return
+
+        if not self.controller.is_connected:
+            self.controller.y_stage_module_id = int(value)
+            return
+
+        old_id = int(self.controller.y_stage_module_id)
+        try:
+            self.controller.set_y_stage_module_id(int(value))
+            self.status_label.setText(
+                "Connected "
+                f"(X Stage ID {self.controller.stage_module_id}, "
+                f"Y Stage ID {self.controller.y_stage_module_id}, "
+                f"Z Stage ID {self.controller.z_stage_module_id})"
+            )
+        except Exception as exc:
+            self._setting_y_stage_id = True
+            try:
+                self.y_stage_id_spin.setValue(old_id)
+            finally:
+                self._setting_y_stage_id = False
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Y Stage ID Switch Failed",
+                f"Failed to switch Y Stage ID to {value}:\n{exc}",
             )
 
     def _on_z_stage_id_changed(self, value: int) -> None:
@@ -2272,7 +2713,10 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         try:
             self.controller.set_z_stage_module_id(int(value))
             self.status_label.setText(
-                f"Connected (X Stage ID {self.controller.stage_module_id}, Z Stage ID {self.controller.z_stage_module_id})"
+                "Connected "
+                f"(X Stage ID {self.controller.stage_module_id}, "
+                f"Y Stage ID {self.controller.y_stage_module_id}, "
+                f"Z Stage ID {self.controller.z_stage_module_id})"
             )
         except Exception as exc:
             self._setting_z_stage_id = True
@@ -2307,6 +2751,18 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Stage Error", str(exc))
             self.status_label.setText("Home failed")
+
+    def _on_home_y_clicked(self) -> None:
+        try:
+            self.status_label.setText("Homing Y...")
+            QtWidgets.QApplication.processEvents()
+            self.controller.home_y()
+            y_pos = self.controller.get_y_position_mm()
+            self.y_label.setText(f"{y_pos:.4f}")
+            self.status_label.setText("Y homed")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Stage Error", str(exc))
+            self.status_label.setText("Y home failed")
 
     def _on_home_z_clicked(self) -> None:
         try:
@@ -2391,6 +2847,65 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         self._abort_event.set()
         self.status_label.setText("Abort requested")
 
+    def _set_manual_motion_enabled(self, enabled: bool) -> None:
+        for btn in (
+            self.move_x_btn,
+            self.move_y_btn,
+            self.move_z_btn,
+            self.jog_x_neg_btn,
+            self.jog_x_pos_btn,
+            self.jog_y_neg_btn,
+            self.jog_y_pos_btn,
+            self.jog_z_neg_btn,
+            self.jog_z_pos_btn,
+        ):
+            btn.setEnabled(bool(enabled))
+
+    def _on_move_axis_absolute(self, axis: str) -> None:
+        if not self.controller.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Not Connected", "Connect devices first.")
+            return
+
+        target = {
+            "x": float(self.manual_x_target_spin.value()),
+            "y": float(self.manual_y_target_spin.value()),
+            "z": float(self.manual_z_target_spin.value()),
+        }[axis]
+
+        try:
+            self.status_label.setText(f"Moving {axis.upper()}...")
+            QtWidgets.QApplication.processEvents()
+            if axis == "x":
+                value = self.controller.move_x_to_mm(target, tolerance_mm=0.01, poll_interval_s=0.05, max_wait_s=20.0)
+                self.x_label.setText(f"{value:.4f}")
+            elif axis == "y":
+                value = self.controller.move_y_to_mm(target, tolerance_mm=0.01, poll_interval_s=0.05, max_wait_s=20.0)
+                self.y_label.setText(f"{value:.4f}")
+            else:
+                value = self.controller.move_z_to_mm(target, tolerance_mm=0.01, poll_interval_s=0.05, max_wait_s=20.0)
+                self.z_label.setText(f"{value:.4f}")
+            self.status_label.setText(f"{axis.upper()} moved to {value:.4f} mm")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Move Error", str(exc))
+            self.status_label.setText(f"{axis.upper()} move failed")
+
+    def _on_jog_axis(self, axis: str, direction: float) -> None:
+        step = abs(float(self.manual_jog_step_spin.value())) * float(direction)
+        try:
+            if axis == "x":
+                current = self.controller.get_x_position_mm()
+                self.manual_x_target_spin.setValue(current + step)
+            elif axis == "y":
+                current = self.controller.get_y_position_mm()
+                self.manual_y_target_spin.setValue(current + step)
+            else:
+                current = self.controller.get_z_position_mm()
+                self.manual_z_target_spin.setValue(current + step)
+            self._on_move_axis_absolute(axis)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Jog Error", str(exc))
+            self.status_label.setText(f"{axis.upper()} jog failed")
+
     def _on_zero_force_clicked(self) -> None:
         if not self.controller.is_connected:
             QtWidgets.QMessageBox.warning(self, "Not Connected", "Connect devices first.")
@@ -2428,10 +2943,12 @@ class ExperimentPanel(QtWidgets.QMainWindow):
     def _set_running_ui(self, running: bool) -> None:
         self.connect_btn.setEnabled(not running)
         self.home_btn.setEnabled(not running)
+        self.home_y_btn.setEnabled(not running and self.controller.is_connected)
         self.home_z_btn.setEnabled(not running and self.controller.is_connected)
         self.probe_btn.setEnabled(not running and self.controller.is_connected)
         self.start_btn.setEnabled(not running)
         self.abort_btn.setEnabled(running)
+        self._set_manual_motion_enabled((not running) and self.controller.is_connected)
         self.zero_force_btn.setEnabled(
             (not running)
             and self.controller.is_connected
@@ -2670,15 +3187,21 @@ class ExperimentPanel(QtWidgets.QMainWindow):
         x_value = snapshot.get("x_mm", float("nan"))
         if np.isfinite(x_value):
             self.x_label.setText(f"{x_value:.4f}")
+        y_value = snapshot.get("y_mm", float("nan"))
+        if np.isfinite(y_value):
+            self.y_label.setText(f"{y_value:.4f}")
         z_value = snapshot.get("z_mm", float("nan"))
         if np.isfinite(z_value):
             self.z_label.setText(f"{z_value:.4f}")
         self._refresh_force_plot()
         self._refresh_fbg_plot()
         x_err = str(snapshot.get("x_read_error", "") or "").strip()
+        y_err = str(snapshot.get("y_read_error", "") or "").strip()
         z_err = str(snapshot.get("z_read_error", "") or "").strip()
         if x_err:
             self.status_label.setText(f"X read issue: {x_err}")
+        elif y_err:
+            self.status_label.setText(f"Y read issue: {y_err}")
         elif z_err:
             self.status_label.setText(f"Z read issue: {z_err}")
 
@@ -2809,6 +3332,13 @@ def parse_args() -> argparse.Namespace:
         help="X stage module ID to control (1/2/3).",
     )
     parser.add_argument(
+        "--y-stage-id",
+        type=int,
+        default=2,
+        choices=[1, 2, 3],
+        help="Y stage module ID to control for manual XYZ motion (default: 2).",
+    )
+    parser.add_argument(
         "--z-stage-id",
         type=int,
         default=3,
@@ -2825,6 +3355,35 @@ def parse_args() -> argparse.Namespace:
         "--invert-z-axis",
         action="store_true",
         help="Invert Z software coordinates and use software Z home (use when Z direction appears reversed).",
+    )
+    parser.add_argument(
+        "--enable-realsense",
+        action="store_true",
+        help="Enable Intel RealSense RGB capture during end averaging window.",
+    )
+    parser.add_argument(
+        "--realsense-serial",
+        type=str,
+        default="",
+        help="Optional RealSense serial number to bind to a specific camera.",
+    )
+    parser.add_argument(
+        "--realsense-width",
+        type=int,
+        default=640,
+        help="RealSense color stream width in pixels.",
+    )
+    parser.add_argument(
+        "--realsense-height",
+        type=int,
+        default=480,
+        help="RealSense color stream height in pixels.",
+    )
+    parser.add_argument(
+        "--realsense-fps",
+        type=int,
+        default=30,
+        help="RealSense color stream frame rate.",
     )
     parser.add_argument(
         "--whisker-name",
@@ -2890,6 +3449,16 @@ def main() -> int:
             else ""
         )
     )
+    print(
+        "[ExperimentPanel] RealSense enabled: "
+        f"{bool(args.enable_realsense)}"
+        + (
+            f" (serial={args.realsense_serial or '<auto>'}, "
+            f"{int(args.realsense_width)}x{int(args.realsense_height)}@{int(args.realsense_fps)}fps)"
+            if bool(args.enable_realsense)
+            else ""
+        )
+    )
     print(f"[ExperimentPanel] Z axis inverted: {bool(args.invert_z_axis)}")
     print(f"[ExperimentPanel] Z total steps: {int(args.z_total_steps)}")
 
@@ -2899,6 +3468,7 @@ def main() -> int:
         bota_interface_override=args.bota_interface,
         fbg_interrogator_cfg=fbg_cfg,
         stage_module_id=args.stage_id,
+        y_stage_module_id=args.y_stage_id,
         z_stage_module_id=args.z_stage_id,
         z_total_steps=args.z_total_steps,
         invert_z_axis=bool(args.invert_z_axis),
@@ -2912,6 +3482,11 @@ def main() -> int:
         loadcell_serial=args.loadcell_serial,
         loadcell_calibration_path=args.loadcell_cal,
         loadcell_attach_timeout_s=args.loadcell_attach_timeout,
+        enable_realsense=bool(args.enable_realsense),
+        realsense_serial=args.realsense_serial,
+        realsense_width=args.realsense_width,
+        realsense_height=args.realsense_height,
+        realsense_fps=args.realsense_fps,
     )
 
     app = QtWidgets.QApplication(sys.argv)

@@ -667,7 +667,21 @@ def run_stream(args, stop_event: threading.Event) -> int:
             avg_raw, n = sensor.tare(args.tare_window)
             print(f"[tare] zero_offset={avg_raw:.12g} ({n} samples)")
 
-        csv_file = open(out_path, "w", newline="", encoding="utf-8")
+        try:
+            csv_file = open(out_path, "w", newline="", encoding="utf-8")
+        except PermissionError as exc:
+            if args.out:
+                raise RuntimeError(
+                    f"Cannot write output CSV: {out_path}. "
+                    "Check file/folder permissions or choose another path with --out."
+                ) from exc
+            fallback_path = f"force_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            print(
+                f"[warn] Cannot write default CSV '{out_path}' (permission denied). "
+                f"Using '{fallback_path}' instead."
+            )
+            out_path = fallback_path
+            csv_file = open(out_path, "w", newline="", encoding="utf-8")
         writer = csv.writer(csv_file)
         if args.force_only:
             writer.writerow(["t_host", "force_N"])

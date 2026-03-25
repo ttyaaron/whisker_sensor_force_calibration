@@ -17,15 +17,19 @@ env/
 experiment_data/
 experiment_data_*/
 experiment_plot_*/
+experiment_plots_*/
 experiment_plot_*.zip
 experiment_plots/
+reanalysis*/
 
 # --- Local measurement exports and intermediate calibration data (DO NOT TRACK) ---
 force*.csv
+trace_trial*.csv
 
 # --- Generated figures/reports (DO NOT TRACK) ---
 calibration_fit*.png
 calibration_fit*.svg
+trace_trial*.png
 
 # --- Generic editor/OS noise (DO NOT TRACK) ---
 .DS_Store

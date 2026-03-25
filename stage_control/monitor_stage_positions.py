@@ -2,14 +2,27 @@
 实时显示线性平台位置
 可视化X, Y, Z轴的当前位置和移动轨迹
 """
-import serial
-import serial.tools.list_ports
+from pathlib import Path
+try:
+    import serial
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "缺少依赖 pyserial。请安装后重试:\n"
+        "  pip install pyserial\n"
+        "或在 conda 环境中:\n"
+        "  conda install pyserial"
+    ) from exc
 import time
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from collections import deque
 import numpy as np
 from stage_module import StageModuleControl
+
+try:
+    import serial.tools.list_ports as serial_list_ports
+except Exception:
+    serial_list_ports = None
 
 # 配置
 UPDATE_INTERVAL = 100  # 更新间隔(ms)
@@ -29,18 +42,56 @@ sz = None
 start_time = None
 stop_flag = False
 
+
+def _ensure_serial_runtime():
+    if not hasattr(serial, "Serial"):
+        raise RuntimeError(
+            "当前环境缺少可用的 pyserial。请先安装: pip install pyserial"
+        )
+
 def find_serial_port():
     """查找USB Serial Port"""
-    ports = serial.tools.list_ports.comports()
-    for port in ports:
-        if "USB Serial" in port.description or "COM11" in port.device:
-            return port.device
-    # 如果没找到，返回第一个端口
-    return ports[0].device if ports else None
+    candidates = []
+
+    if serial_list_ports is not None:
+        ports = list(serial_list_ports.comports())
+        for port in ports:
+            desc = (port.description or "").lower()
+            dev = port.device
+            if not dev:
+                continue
+            if "usb serial" in desc or "ftdi" in desc or "ch340" in desc or "cp210" in desc:
+                candidates.append(dev)
+        for port in ports:
+            if port.device:
+                candidates.append(port.device)
+
+    by_id_dir = Path("/dev/serial/by-id")
+    if by_id_dir.is_dir():
+        for path in sorted(by_id_dir.iterdir()):
+            resolved = str(path.resolve()) if path.exists() else ""
+            if resolved.startswith("/dev/ttyUSB") or resolved.startswith("/dev/ttyACM"):
+                candidates.insert(0, str(path))
+
+    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*"):
+        for path in sorted(Path("/dev").glob(pattern.replace("/dev/", ""))):
+            candidates.append(str(path))
+
+    seen = set()
+    deduped = []
+    for dev in candidates:
+        if dev in seen:
+            continue
+        seen.add(dev)
+        deduped.append(dev)
+
+    return deduped[0] if deduped else None
 
 def init_stages(port):
     """初始化stage连接"""
     global ser, sx, sy, sz, start_time
+
+    _ensure_serial_runtime()
     
     print("="*60)
     print(f"连接到串口: {port}")

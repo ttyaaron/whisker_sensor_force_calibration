@@ -60,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated masses in grams, e.g. 0,2,51.8,144.3,137.1,186.9",
     )
     p.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="Number of repeated captures per mass (fit uses per-mass averaged raw value).",
+    )
+    p.add_argument(
         "--with-zero",
         action="store_true",
         help="Also capture an initial 0 g point before the listed masses",
@@ -91,6 +97,10 @@ def main() -> int:
         print("Need at least 2 masses for linear calibration.", file=sys.stderr)
         return 2
 
+    if int(args.repeats) < 1:
+        print("--repeats must be >= 1.", file=sys.stderr)
+        return 2
+
     interval_ms = compute_interval_ms(args.rate, args.interval_ms)
 
     stop_event = threading.Event()
@@ -119,6 +129,7 @@ def main() -> int:
         print("Calibration sequence")
         print(f"- Channel: {args.channel}")
         print(f"- Masses (g): {masses}")
+        print(f"- Repeats per mass: {args.repeats}")
         print(f"- Capture window: {args.capture_window:.2f} s")
         print("- Keep setup stable before each capture")
 
@@ -126,13 +137,31 @@ def main() -> int:
             if stop_event.is_set():
                 break
 
-            if mass_g == 0.0:
-                prompt = "Remove all load (0 g), then press Enter to capture..."
-            else:
-                prompt = f"Place {mass_g:g} g, then press Enter to capture..."
-            input(f"\n{prompt}")
+            repeat_raws = []
+            repeat_samples = []
+            for rep_idx in range(1, args.repeats + 1):
+                if mass_g == 0.0:
+                    prompt = f"Remove all load (0 g), then press Enter to capture ({rep_idx}/{args.repeats})..."
+                else:
+                    prompt = f"Place {mass_g:g} g, then press Enter to capture ({rep_idx}/{args.repeats})..."
+                input(f"\n{prompt}")
 
-            avg_raw, n = sensor.get_average_raw(args.capture_window)
+                avg_raw_rep, n_rep = sensor.get_average_raw(args.capture_window)
+                repeat_raws.append(float(avg_raw_rep))
+                repeat_samples.append(int(n_rep))
+                print(
+                    f"  [rep {rep_idx}/{args.repeats}] raw_avg={avg_raw_rep:.12g} samples={n_rep}"
+                )
+
+            avg_raw = sum(repeat_raws) / float(len(repeat_raws))
+            n = sum(repeat_samples)
+            if len(repeat_raws) > 1:
+                mean_rep = avg_raw
+                var_rep = sum((v - mean_rep) ** 2 for v in repeat_raws) / float(len(repeat_raws) - 1)
+                std_rep = var_rep ** 0.5
+            else:
+                std_rep = 0.0
+
             force_n = mass_g * GRAM_TO_NEWTON
             points.append(
                 {
@@ -140,11 +169,15 @@ def main() -> int:
                     "force_N": force_n,
                     "bridge_value": avg_raw,
                     "samples": n,
+                    "repeat_count": int(args.repeats),
+                    "repeat_bridge_values": repeat_raws,
+                    "repeat_samples": repeat_samples,
+                    "repeat_std_bridge_value": std_rep,
                 }
             )
             print(
                 f"[captured] mass={mass_g:g} g force={force_n:.6f} N "
-                f"raw_avg={avg_raw:.12g} samples={n}"
+                f"raw_avg={avg_raw:.12g} samples={n} std={std_rep:.3g}"
             )
 
         if len(points) < 2:

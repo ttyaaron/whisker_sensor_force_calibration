@@ -40,6 +40,7 @@ fi
 
 has_stage_port=0
 has_stage_id=0
+has_z_stage_id=0
 has_bota_iface=0
 for ((i=0; i<${#USER_ARGS[@]}; i++)); do
   arg="${USER_ARGS[$i]}"
@@ -57,6 +58,13 @@ for ((i=0; i<${#USER_ARGS[@]}; i++)); do
       ;;
     --stage-id=*)
       has_stage_id=1
+      ;;
+    --z-stage-id)
+      has_z_stage_id=1
+      i=$((i+1))
+      ;;
+    --z-stage-id=*)
+      has_z_stage_id=1
       ;;
     --bota-interface)
       has_bota_iface=1
@@ -97,6 +105,10 @@ fi
 
 if [[ "${has_stage_id}" -eq 0 && -n "${STAGE_MODULE_ID:-}" ]]; then
   AUTO_ARGS+=(--stage-id "${STAGE_MODULE_ID}")
+fi
+
+if [[ "${has_z_stage_id}" -eq 0 && -n "${STAGE_Z_MODULE_ID:-}" ]]; then
+  AUTO_ARGS+=(--z-stage-id "${STAGE_Z_MODULE_ID}")
 fi
 
 if [[ "${want_bota}" -eq 1 && "${has_bota_iface}" -eq 0 && -z "${BOTA_NETWORK_INTERFACE:-}" ]]; then

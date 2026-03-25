@@ -1,15 +1,15 @@
 {
-  "offset": 0.0005700911431795942,
-  "scale": 1353.2801091618924,
+  "offset": 0.0005613693625086841,
+  "scale": 1263.0213763511,
   "timestamp": "2026-03-22T23:11:46.688983+00:00",
   "channel": 0,
-  "notes": "",
+  "notes": "Range-limited: 2.1-42.1g only (subset of full calibration)",
   "gain": 128,
   "interval_ms": 5,
   "fit": {
-    "slope": 1353.2801091618924,
-    "intercept": -0.7714930044743091,
-    "r2": 0.9485535512564209,
+    "slope": 1263.0213763511,
+    "intercept": -0.7090215048770577,
+    "r2": 0.9853033328295823,
     "equation": "force_N = slope * bridge_value + intercept",
     "equivalent": "force_N = (bridge_value - offset) * scale"
   },
@@ -103,60 +103,6 @@
         400
       ],
       "repeat_std_bridge_value": 2.521748572830991e-07
-    },
-    {
-      "mass_g": 52.1,
-      "force_N": 0.510926465,
-      "bridge_value": 0.001017487933083127,
-      "samples": 1200,
-      "repeat_count": 3,
-      "repeat_bridge_values": [
-        0.001017381283454597,
-        0.0010175116476602852,
-        0.0010175708681344985
-      ],
-      "repeat_samples": [
-        400,
-        400,
-        400
-      ],
-      "repeat_std_bridge_value": 9.699161608454606e-08
-    },
-    {
-      "mass_g": 62.1,
-      "force_N": 0.608992965,
-      "bridge_value": 0.001009286194263647,
-      "samples": 1200,
-      "repeat_count": 3,
-      "repeat_bridge_values": [
-        0.0010098573472350836,
-        0.0010092168278060852,
-        0.001008784407749772
-      ],
-      "repeat_samples": [
-        400,
-        400,
-        400
-      ],
-      "repeat_std_bridge_value": 5.398227152141321e-07
-    },
-    {
-      "mass_g": 72.1,
-      "force_N": 0.7070594649999999,
-      "bridge_value": 0.001019922288445135,
-      "samples": 1200,
-      "repeat_count": 3,
-      "repeat_bridge_values": [
-        0.001019801904913038,
-        0.0010200441908091308,
-        0.001019920769613236
-      ],
-      "repeat_samples": [
-        400,
-        400,
-        400
-      ],
-      "repeat_std_bridge_value": 1.2115008872929976e-07
     }
   ]
 }
